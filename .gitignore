@@ -1,0 +1,19 @@
+# Rust
+/ghost-core/target/
+
+# Python / uv
+/ghost-daemon/.venv/
+/ghost-daemon/__pycache__/
+*.pyc
+.uv/
+
+# Local databases & state
+*.sqlite
+*.sqlite3
+*.db
+/tmp/
+
+# System / IDE
+.DS_Store
+.vscode/
+.idea/
