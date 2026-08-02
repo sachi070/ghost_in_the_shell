@@ -1,19 +1,63 @@
-# Rust
-/ghost-core/target/
+# ==========================================
+# Rust / Cargo (ghost-core)
+# ==========================================
+/target/
+/**/target/
+Cargo.lock
 
-# Python / uv
-/ghost-daemon/.venv/
-/ghost-daemon/__pycache__/
-*.pyc
-.uv/
+# ==========================================
+# Python / Virtual Environments (ghost-daemon)
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Local databases & state
+# ==========================================
+# Application / Ghost Runtime Data
+# ==========================================
+# SQLite DBs, local config secrets, logs
+*.db
 *.sqlite
 *.sqlite3
-*.db
-/tmp/
+.ghost/
+config.toml
+!config/default.toml # Keeps default template checked in
+ghost.sock
 
-# System / IDE
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.local
+.env.*.local
+
+# ==========================================
+# Operating System & IDE Files
+# ==========================================
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
 .DS_Store
-.vscode/
+
+# VS Code / JetBrains
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
 .idea/
+
+# Terminal / Build artifacts
+*.log
+*.tmp
