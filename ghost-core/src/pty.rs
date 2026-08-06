@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::env;
 
 pub struct ShellPty {
-    pub pair: PtyPair,
+    pub master: Box<dyn MasterPty + Send>,
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -21,7 +21,6 @@ impl ShellPty {
             })
             .context("Failed to allocate PTY pair")?;
 
-        // Windows / Bash default shell lookup
         let shell = env::var("SHELL").unwrap_or_else(|_| {
             if cfg!(windows) {
                 "cmd.exe".to_string()
@@ -31,24 +30,26 @@ impl ShellPty {
         });
 
         let mut cmd = CommandBuilder::new(&shell);
+
+        if let Ok(path_val) = env::var("PATH") {
+            cmd.env("PATH", path_val);
+        }
+
         cmd.env("TERM", "xterm-256color");
         cmd.env("GHOST_INSIDE", "1");
+        cmd.env(
+            "PROMPT_COMMAND",
+            "printf \"\\033]1337;GhostExit=%d\\007\" \"$?\"",
+        );
 
         let child = pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn shell into PTY slave")?;
 
-        Ok(Self { pair, child })
-    }
-
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        self.pair.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        Ok(())
+        Ok(Self {
+            master: pair.master,
+            child,
+        })
     }
 }
