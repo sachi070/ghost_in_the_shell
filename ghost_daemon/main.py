@@ -1,18 +1,20 @@
 import asyncio
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 from fastapi import FastAPI
-
+load_dotenv()
 from db import init_db, log_interception
 from ipc_server import start_ipc_server
+from llm_client import get_ai_diagnosis
 from models import DiagnoseRequest, DiagnoseResponse
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize SQLite database
+    # Initialize SQLite schema
     init_db()
 
-    # Spawn IPC server in background loop when FastAPI starts
+    # Spawn IPC TCP listener in background
     ipc_task = asyncio.create_task(start_ipc_server())
     yield
     ipc_task.cancel()
@@ -28,11 +30,33 @@ async def health_check():
 
 @app.post("/diagnose", response_model=DiagnoseResponse)
 async def diagnose(req: DiagnoseRequest):
-    diagnosis = f"HTTP Endpoint: Command '{req.command}' failed with exit code {req.exit_code}"
-    suggested_fix = "ghost doctor"
-    explanation = f"Captured context for command: {req.command}"
+    ai_result = await get_ai_diagnosis(
+        command=req.command,
+        exit_code=req.exit_code,
+        context=req.output_context,
+    )
 
-    # Log to SQLite session database
+    if ai_result:
+        diagnosis = ai_result.diagnosis
+        suggested_fix = ai_result.suggested_fix
+        explanation = ai_result.explanation
+        source = "llm"
+        confidence = 0.95
+    else:
+        if "cat" in req.command and "No such file or directory" in req.output_context:
+            missing_file = req.command.split()[-1] if len(req.command.split()) > 1 else "file"
+            diagnosis = f"Target file '{missing_file}' does not exist in the current directory."
+            suggested_fix = f"touch {missing_file}"
+            explanation = "The cat command requires an existing file path to read."
+            source = "fast_path"
+            confidence = 0.85
+        else:
+            diagnosis = f"Command '{req.command}' failed with exit code {req.exit_code}."
+            suggested_fix = "ghost doctor"
+            explanation = "Fallback stub response. Verify GROQ_API_KEY in .env file."
+            source = "stub"
+            confidence = 0.50
+
     log_interception(
         command=req.command,
         exit_code=req.exit_code,
@@ -44,8 +68,8 @@ async def diagnose(req: DiagnoseRequest):
         diagnosis=diagnosis,
         suggested_fix=suggested_fix,
         explanation=explanation,
-        confidence=1.0,
-        source="stub",
+        confidence=confidence,
+        source=source,
     )
 
 

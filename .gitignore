@@ -61,3 +61,8 @@ $RECYCLE.BIN/
 # Terminal / Build artifacts
 *.log
 *.tmp
+
+.env
+.venv/
+ghost_session.db
+__pycache__/

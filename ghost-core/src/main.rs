@@ -51,6 +51,7 @@ fn main() -> anyhow::Result<()> {
                     if let CommandStatus::Finished { exit_code } = parser.parse_bytes(bytes) {
                         if exit_code != 0 {
                             let context = ring_buffer.get_context();
+                            let failed_cmd = ring_buffer.extract_last_command();
 
                             let failure_msg = format!(
                                 "\r\n\x1b[33m[Ghost Intercepted Failure: Exit Code {}]\x1b[0m\r\n",
@@ -59,7 +60,7 @@ fn main() -> anyhow::Result<()> {
                             let _ = stdout_lock.write_all(failure_msg.as_bytes());
 
                             if let Ok(resp) = handle.block_on(ipc_client::send_diagnose_request(
-                                "last_command",
+                                &failed_cmd,
                                 exit_code,
                                 &context,
                             )) {
