@@ -20,8 +20,8 @@ fn main() -> anyhow::Result<()> {
     let mut pty_reader = shell_pty.master.try_clone_reader()?;
     let mut pty_writer = shell_pty.master.take_writer()?;
 
-    // Background runtime for async IPC calls
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // Multi-threaded runtime for async HTTP calls
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let handle = rt.handle().clone();
@@ -41,6 +41,13 @@ fn main() -> anyhow::Result<()> {
                     let bytes = &buffer[..n];
                     ring_buffer.push_bytes(bytes);
 
+                    // 1. Flush raw shell output to screen FIRST
+                    if stdout_lock.write_all(bytes).is_err() {
+                        break;
+                    }
+                    let _ = stdout_lock.flush();
+
+                    // 2. Intercept non-zero exit status after command output is displayed
                     if let CommandStatus::Finished { exit_code } = parser.parse_bytes(bytes) {
                         if exit_code != 0 {
                             let context = ring_buffer.get_context();
@@ -51,31 +58,20 @@ fn main() -> anyhow::Result<()> {
                             );
                             let _ = stdout_lock.write_all(failure_msg.as_bytes());
 
-                            handle.spawn(async move {
-                                if let Ok(resp) = ipc_client::send_diagnose_request(
-                                    "last_command",
-                                    exit_code,
-                                    &context,
-                                )
-                                .await
-                                {
-                                    let diag_msg = format!(
-                                        "\x1b[36m[Ghost Diagnosis]: {}\x1b[0m\r\n\x1b[32m[Suggested Fix]: {}\x1b[0m\r\n",
-                                        resp.diagnosis, resp.suggested_fix
-                                    );
-                                    let stdout = io::stdout();
-                                    let mut lock = stdout.lock();
-                                    let _ = lock.write_all(diag_msg.as_bytes());
-                                    let _ = lock.flush();
-                                }
-                            });
+                            if let Ok(resp) = handle.block_on(ipc_client::send_diagnose_request(
+                                "last_command",
+                                exit_code,
+                                &context,
+                            )) {
+                                let diag_msg = format!(
+                                    "\x1b[36m[Ghost Diagnosis]: {}\x1b[0m\r\n\x1b[32m[Suggested Fix]: {}\x1b[0m\r\n",
+                                    resp.diagnosis, resp.suggested_fix
+                                );
+                                let _ = stdout_lock.write_all(diag_msg.as_bytes());
+                                let _ = stdout_lock.flush();
+                            }
                         }
                     }
-
-                    if stdout_lock.write_all(bytes).is_err() {
-                        break;
-                    }
-                    let _ = stdout_lock.flush();
                 }
                 Err(_) => break,
             }
@@ -92,7 +88,6 @@ fn main() -> anyhow::Result<()> {
         // 2. Non-blocking input polling (10ms tick rate)
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
-                // Filter out KeyRelease events on Windows (prevents double typing)
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                     match key.code {
                         KeyCode::Char(c) => {
