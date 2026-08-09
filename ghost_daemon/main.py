@@ -7,6 +7,7 @@ from db import init_db, log_interception
 from ipc_server import start_ipc_server
 from llm_client import get_ai_diagnosis
 from models import DiagnoseRequest, DiagnoseResponse
+from db import get_recent_interceptions
 
 
 @asynccontextmanager
@@ -72,6 +73,10 @@ async def diagnose(req: DiagnoseRequest):
         source=source,
     )
 
+@app.get("/history")
+async def get_history(limit: int = 10):
+    records = get_recent_interceptions(limit=limit)
+    return {"status": "ok", "count": len(records), "history": records}
 
 if __name__ == "__main__":
     import uvicorn

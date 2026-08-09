@@ -47,11 +47,41 @@ fn main() -> anyhow::Result<()> {
                     }
                     let _ = stdout_lock.flush();
 
-                    // 2. Intercept non-zero exit status after command output is displayed
+                    // 2. Intercept command completions
                     if let CommandStatus::Finished { exit_code } = parser.parse_bytes(bytes) {
-                        if exit_code != 0 {
+                        let failed_cmd = ring_buffer.extract_last_command();
+
+                        // Check if the user ran 'ghost doctor'
+                        if failed_cmd.contains("ghost doctor") {
+                            let doctor_header = "\r\n\x1b[35m=== Ghost Doctor: Recent CLI Interception History ===\x1b[0m\r\n";
+                            let _ = stdout_lock.write_all(doctor_header.as_bytes());
+
+                            if let Ok(hist) = handle.block_on(ipc_client::fetch_history(5)) {
+                                if hist.history.is_empty() {
+                                    let _ = stdout_lock.write_all(
+                                        b"No intercepted failures found in ghost_session.db.\r\n",
+                                    );
+                                } else {
+                                    for record in hist.history {
+                                        let entry = format!(
+                                            "\x1b[33m[{}]\x1b[0m \x1b[1mCommand:\x1b[0m {}\r\n  \x1b[36mDiagnosis:\x1b[0m {}\r\n  \x1b[32mSuggested Fix:\x1b[0m {}\r\n\r\n",
+                                            record.timestamp,
+                                            record.command,
+                                            record.diagnosis,
+                                            record.suggested_fix
+                                        );
+                                        let _ = stdout_lock.write_all(entry.as_bytes());
+                                    }
+                                }
+                            } else {
+                                let _ = stdout_lock.write_all(
+                                    b"\x1b[31mFailed to connect to ghost_daemon at http://127.0.0.1:8000\x1b[0m\r\n",
+                                );
+                            }
+                            let _ = stdout_lock.flush();
+                        } else if exit_code != 0 {
+                            // Standard non-zero exit code interception logic
                             let context = ring_buffer.get_context();
-                            let failed_cmd = ring_buffer.extract_last_command();
 
                             let failure_msg = format!(
                                 "\r\n\x1b[33m[Ghost Intercepted Failure: Exit Code {}]\x1b[0m\r\n",

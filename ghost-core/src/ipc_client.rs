@@ -1,17 +1,13 @@
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize)]
-pub struct DiagnoseRequest {
-    pub command: String,
+#[derive(Debug, Serialize)]
+pub struct DiagnoseRequest<'a> {
+    pub command: &'a str,
     pub exit_code: i32,
-    pub output_context: String,
-    pub cwd: String,
-    pub project_type: String,
+    pub output_context: &'a str,
 }
 
-#[allow(dead_code)]
-#[derive(Deserialize, Debug)]
+#[derive(Debug, Deserialize)]
 pub struct DiagnoseResponse {
     pub diagnosis: String,
     pub suggested_fix: String,
@@ -20,22 +16,33 @@ pub struct DiagnoseResponse {
     pub source: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HistoryRecord {
+    pub id: i32,
+    pub timestamp: String,
+    pub command: String,
+    pub exit_code: i32,
+    pub diagnosis: String,
+    pub suggested_fix: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryResponse {
+    pub status: String,
+    pub count: usize,
+    pub history: Vec<HistoryRecord>,
+}
+
 pub async fn send_diagnose_request(
     command: &str,
     exit_code: i32,
-    context: &str,
-) -> Result<DiagnoseResponse> {
+    output_context: &str,
+) -> Result<DiagnoseResponse, reqwest::Error> {
     let client = reqwest::Client::new();
-    let cwd = std::env::current_dir()?
-        .to_string_lossy()
-        .to_string();
-
     let payload = DiagnoseRequest {
-        command: command.to_string(),
+        command,
         exit_code,
-        output_context: context.to_string(),
-        cwd,
-        project_type: "unknown".to_string(),
+        output_context,
     };
 
     let res = client
@@ -44,6 +51,18 @@ pub async fn send_diagnose_request(
         .send()
         .await?
         .json::<DiagnoseResponse>()
+        .await?;
+
+    Ok(res)
+}
+
+pub async fn fetch_history(limit: usize) -> Result<HistoryResponse, reqwest::Error> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("http://127.0.0.1:8000/history?limit={}", limit))
+        .send()
+        .await?
+        .json::<HistoryResponse>()
         .await?;
 
     Ok(res)
