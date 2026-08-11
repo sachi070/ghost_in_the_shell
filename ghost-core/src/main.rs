@@ -9,6 +9,7 @@ use buffer::RollingBuffer;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use pty::ShellPty;
 use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use terminal::RawModeGuard;
@@ -17,8 +18,26 @@ fn main() -> anyhow::Result<()> {
     let mut shell_pty = ShellPty::spawn()?;
     let raw_guard = RawModeGuard::new()?;
 
-    let mut pty_reader = shell_pty.master.try_clone_reader()?;
-    let mut pty_writer = shell_pty.master.take_writer()?;
+    let pty_reader = shell_pty.master.try_clone_reader()?;
+    let raw_writer = shell_pty.master.take_writer()?;
+
+    // Thread-safe shared PTY writer (wrapped in Option so it can be cleanly dropped on exit)
+    type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+    let shared_writer: SharedWriter = Arc::new(Mutex::new(Some(raw_writer)));
+    let writer_for_reader = Arc::clone(&shared_writer);
+    let writer_for_main = Arc::clone(&shared_writer);
+
+    // Register no-op aliases ('f' and 'fix') in bash to suppress 'command not found'
+    if let Ok(mut guard) = shared_writer.lock() {
+        if let Some(ref mut writer) = *guard {
+            let _ = writer.write_all(b"alias f=':' 2>/dev/null; alias fix=':' 2>/dev/null; clear\r");
+            let _ = writer.flush();
+        }
+    }
+
+    // Thread-safe storage for the latest AI suggested fix
+    let last_suggested_fix: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_fix_reader = Arc::clone(&last_suggested_fix);
 
     // Multi-threaded runtime for async HTTP calls
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -27,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     let handle = rt.handle().clone();
 
     // Thread 1: PTY Master -> Host stdout + Interception
+    let mut reader = pty_reader;
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         let stdout = io::stdout();
@@ -35,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         let mut ring_buffer = RollingBuffer::new(50);
 
         loop {
-            match pty_reader.read(&mut buffer) {
+            match reader.read(&mut buffer) {
                 Ok(0) => break, // PTY EOF when shell exits
                 Ok(n) => {
                     let bytes = &buffer[..n];
@@ -49,10 +69,37 @@ fn main() -> anyhow::Result<()> {
 
                     // 2. Intercept command completions
                     if let CommandStatus::Finished { exit_code } = parser.parse_bytes(bytes) {
-                        let failed_cmd = ring_buffer.extract_last_command();
+                        let last_cmd = ring_buffer.extract_last_command();
+                        let trimmed_cmd = last_cmd.trim();
 
-                        // Check if the user ran 'ghost doctor'
-                        if failed_cmd.contains("ghost doctor") {
+                        // A. Check if user typed 'fix' or 'f' to run the suggested fix
+                        if trimmed_cmd == "fix" || trimmed_cmd == "f" {
+                            if let Ok(mut fix_guard) = last_fix_reader.lock() {
+                                if let Some(fix_cmd) = fix_guard.take() {
+                                    let exec_msg = format!(
+                                        "\r\n\x1b[32m[Ghost Executing Fix]: {}\x1b[0m\r\n",
+                                        fix_cmd
+                                    );
+                                    let _ = stdout_lock.write_all(exec_msg.as_bytes());
+                                    let _ = stdout_lock.flush();
+
+                                    // Inject suggested fix command into PTY stdin
+                                    if let Ok(mut writer_guard) = writer_for_reader.lock() {
+                                        if let Some(ref mut writer) = *writer_guard {
+                                            let _ = writer.write_all(fix_cmd.as_bytes());
+                                            let _ = writer.write_all(b"\r");
+                                            let _ = writer.flush();
+                                        }
+                                    }
+                                } else {
+                                    let _ = stdout_lock.write_all(
+                                        b"\r\n\x1b[33m[Ghost]: No pending fix available.\x1b[0m\r\n",
+                                    );
+                                    let _ = stdout_lock.flush();
+                                }
+                            }
+                        // B. Check if user ran 'ghost doctor'
+                        } else if trimmed_cmd.contains("ghost doctor") {
                             let doctor_header = "\r\n\x1b[35m=== Ghost Doctor: Recent CLI Interception History ===\x1b[0m\r\n";
                             let _ = stdout_lock.write_all(doctor_header.as_bytes());
 
@@ -79,8 +126,8 @@ fn main() -> anyhow::Result<()> {
                                 );
                             }
                             let _ = stdout_lock.flush();
+                        // C. Standard non-zero exit code interception
                         } else if exit_code != 0 {
-                            // Standard non-zero exit code interception logic
                             let context = ring_buffer.get_context();
 
                             let failure_msg = format!(
@@ -89,17 +136,32 @@ fn main() -> anyhow::Result<()> {
                             );
                             let _ = stdout_lock.write_all(failure_msg.as_bytes());
 
-                            if let Ok(resp) = handle.block_on(ipc_client::send_diagnose_request(
-                                &failed_cmd,
+                            match handle.block_on(ipc_client::send_diagnose_request(
+                                &last_cmd,
                                 exit_code,
                                 &context,
                             )) {
-                                let diag_msg = format!(
-                                    "\x1b[36m[Ghost Diagnosis]: {}\x1b[0m\r\n\x1b[32m[Suggested Fix]: {}\x1b[0m\r\n",
-                                    resp.diagnosis, resp.suggested_fix
-                                );
-                                let _ = stdout_lock.write_all(diag_msg.as_bytes());
-                                let _ = stdout_lock.flush();
+                                Ok(resp) => {
+                                    // Store suggested fix in shared memory
+                                    if let Ok(mut fix_guard) = last_fix_reader.lock() {
+                                        *fix_guard = Some(resp.suggested_fix.clone());
+                                    }
+
+                                    let diag_msg = format!(
+                                        "\x1b[36m[Ghost Diagnosis]: {}\x1b[0m\r\n\x1b[32m[Suggested Fix]: {}\x1b[0m\r\n\x1b[33m[Type 'fix' or 'f' to auto-execute this fix]\x1b[0m\r\n",
+                                        resp.diagnosis, resp.suggested_fix
+                                    );
+                                    let _ = stdout_lock.write_all(diag_msg.as_bytes());
+                                    let _ = stdout_lock.flush();
+                                }
+                                Err(e) => {
+                                    let err_msg = format!(
+                                        "\x1b[31m[Ghost Daemon Error]: Failed to reach diagnosis server ({})\x1b[0m\r\n",
+                                        e
+                                    );
+                                    let _ = stdout_lock.write_all(err_msg.as_bytes());
+                                    let _ = stdout_lock.flush();
+                                }
                             }
                         }
                     }
@@ -120,58 +182,65 @@ fn main() -> anyhow::Result<()> {
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
-                    match key.code {
-                        KeyCode::Char(c) => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                match c {
-                                    'c' | 'C' => { let _ = pty_writer.write_all(&[3]); }  // Ctrl+C
-                                    'd' | 'D' => { let _ = pty_writer.write_all(&[4]); }  // Ctrl+D
-                                    'z' | 'Z' => { let _ = pty_writer.write_all(&[26]); } // Ctrl+Z
-                                    'l' | 'L' => { let _ = pty_writer.write_all(&[12]); } // Ctrl+L
-                                    _ => {}
+                    if let Ok(mut writer_guard) = writer_for_main.lock() {
+                        if let Some(ref mut writer) = *writer_guard {
+                            match key.code {
+                                KeyCode::Char(c) => {
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        match c {
+                                            'c' | 'C' => { let _ = writer.write_all(&[3]); }  // Ctrl+C
+                                            'd' | 'D' => { let _ = writer.write_all(&[4]); }  // Ctrl+D
+                                            'z' | 'Z' => { let _ = writer.write_all(&[26]); } // Ctrl+Z
+                                            'l' | 'L' => { let _ = writer.write_all(&[12]); } // Ctrl+L
+                                            _ => {}
+                                        }
+                                    } else {
+                                        let mut buf = [0u8; 4];
+                                        let s = c.encode_utf8(&mut buf);
+                                        let _ = writer.write_all(s.as_bytes());
+                                    }
                                 }
-                            } else {
-                                let mut buf = [0u8; 4];
-                                let s = c.encode_utf8(&mut buf);
-                                let _ = pty_writer.write_all(s.as_bytes());
+                                KeyCode::Enter => {
+                                    let _ = writer.write_all(b"\r");
+                                }
+                                KeyCode::Backspace => {
+                                    let _ = writer.write_all(&[8]);
+                                }
+                                KeyCode::Tab => {
+                                    let _ = writer.write_all(b"\t");
+                                }
+                                KeyCode::Esc => {
+                                    let _ = writer.write_all(&[27]);
+                                }
+                                KeyCode::Up => {
+                                    let _ = writer.write_all(b"\x1b[A");
+                                }
+                                KeyCode::Down => {
+                                    let _ = writer.write_all(b"\x1b[B");
+                                }
+                                KeyCode::Right => {
+                                    let _ = writer.write_all(b"\x1b[C");
+                                }
+                                KeyCode::Left => {
+                                    let _ = writer.write_all(b"\x1b[D");
+                                }
+                                _ => {}
                             }
+                            let _ = writer.flush();
                         }
-                        KeyCode::Enter => {
-                            let _ = pty_writer.write_all(b"\r");
-                        }
-                        KeyCode::Backspace => {
-                            let _ = pty_writer.write_all(&[8]);
-                        }
-                        KeyCode::Tab => {
-                            let _ = pty_writer.write_all(b"\t");
-                        }
-                        KeyCode::Esc => {
-                            let _ = pty_writer.write_all(&[27]);
-                        }
-                        KeyCode::Up => {
-                            let _ = pty_writer.write_all(b"\x1b[A");
-                        }
-                        KeyCode::Down => {
-                            let _ = pty_writer.write_all(b"\x1b[B");
-                        }
-                        KeyCode::Right => {
-                            let _ = pty_writer.write_all(b"\x1b[C");
-                        }
-                        KeyCode::Left => {
-                            let _ = pty_writer.write_all(b"\x1b[D");
-                        }
-                        _ => {}
                     }
-                    let _ = pty_writer.flush();
                 }
             }
         }
     }
 
-    // Clean teardown sequence
-    drop(pty_writer);           // Signal EOF to child PTY stdin
-    let _ = reader_handle.join(); // Wait for reader thread to finish draining PTY stdout
-    drop(raw_guard);            // Restore normal terminal modes
+    // Clean teardown sequence: Explicitly close PTY stdin so reader loop sees EOF
+    if let Ok(mut guard) = shared_writer.lock() {
+        *guard = None; // Drops the underlying PTY writer
+    }
+
+    let _ = reader_handle.join(); // Reader thread receives EOF and joins cleanly
+    drop(raw_guard);              // Restore normal terminal modes
     let _ = io::stdout().flush();
 
     Ok(())
