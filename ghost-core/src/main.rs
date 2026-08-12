@@ -15,37 +15,43 @@ use std::time::Duration;
 use terminal::RawModeGuard;
 
 fn main() -> anyhow::Result<()> {
+    // Spawn sub-shell inside PTY master/slave pair and set raw terminal mode
     let mut shell_pty = ShellPty::spawn()?;
     let raw_guard = RawModeGuard::new()?;
 
     let pty_reader = shell_pty.master.try_clone_reader()?;
     let raw_writer = shell_pty.master.take_writer()?;
 
-    // Thread-safe shared PTY writer (wrapped in Option so it can be cleanly dropped on exit)
+    // Thread-safe shared PTY writer wrapped in Option for clean teardown
     type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
     let shared_writer: SharedWriter = Arc::new(Mutex::new(Some(raw_writer)));
     let writer_for_reader = Arc::clone(&shared_writer);
     let writer_for_main = Arc::clone(&shared_writer);
 
-    // Register no-op aliases ('f' and 'fix') in bash to suppress 'command not found'
+    // Register no-op aliases in bash so trigger keywords don't trigger 'command not found'
     if let Ok(mut guard) = shared_writer.lock() {
         if let Some(ref mut writer) = *guard {
-            let _ = writer.write_all(b"alias f=':' 2>/dev/null; alias fix=':' 2>/dev/null; clear\r");
+            let _ = writer.write_all(
+                b"alias f=':' fix=':' y=':' yes=':' Y=':' YES=':' n=':' no=':' N=':' NO=':' 2>/dev/null; clear\r",
+            );
             let _ = writer.flush();
         }
     }
 
-    // Thread-safe storage for the latest AI suggested fix
+    // Shared storage for cached AI fixes and pending [y/N] prompts
     let last_suggested_fix: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let last_fix_reader = Arc::clone(&last_suggested_fix);
 
-    // Multi-threaded runtime for async HTTP calls
+    let pending_confirmation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let pending_conf_reader = Arc::clone(&pending_confirmation);
+
+    // Multi-threaded Tokio runtime for async HTTP calls to ghost_daemon
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let handle = rt.handle().clone();
 
-    // Thread 1: PTY Master -> Host stdout + Interception
+    // Reader thread: Reads PTY stdout and handles command interceptions
     let mut reader = pty_reader;
     let reader_handle = thread::spawn(move || {
         let mut buffer = [0u8; 8192];
@@ -56,41 +62,79 @@ fn main() -> anyhow::Result<()> {
 
         loop {
             match reader.read(&mut buffer) {
-                Ok(0) => break, // PTY EOF when shell exits
+                Ok(0) => break, // PTY EOF on shell exit
                 Ok(n) => {
                     let bytes = &buffer[..n];
                     ring_buffer.push_bytes(bytes);
 
-                    // 1. Flush raw shell output to screen FIRST
+                    // Output shell bytes directly to terminal
                     if stdout_lock.write_all(bytes).is_err() {
                         break;
                     }
                     let _ = stdout_lock.flush();
 
-                    // 2. Intercept command completions
+                    // Check for completed command boundary
                     if let CommandStatus::Finished { exit_code } = parser.parse_bytes(bytes) {
                         let last_cmd = ring_buffer.extract_last_command();
-                        let trimmed_cmd = last_cmd.trim();
+                        let trimmed_cmd = last_cmd.trim().to_lowercase();
 
-                        // A. Check if user typed 'fix' or 'f' to run the suggested fix
-                        if trimmed_cmd == "fix" || trimmed_cmd == "f" {
-                            if let Ok(mut fix_guard) = last_fix_reader.lock() {
-                                if let Some(fix_cmd) = fix_guard.take() {
+                        // 1. Handle user answer to [y/N] prompt
+                        let mut was_pending = false;
+                        if let Ok(mut pending_guard) = pending_conf_reader.lock() {
+                            if let Some(staged_fix) = pending_guard.take() {
+                                was_pending = true;
+
+                                let clean_ans = trimmed_cmd
+                                    .chars()
+                                    .filter(|c| c.is_alphanumeric())
+                                    .collect::<String>();
+
+                                if clean_ans == "y" || clean_ans == "yes" || clean_ans.starts_with('y') {
                                     let exec_msg = format!(
                                         "\r\n\x1b[32m[Ghost Executing Fix]: {}\x1b[0m\r\n",
-                                        fix_cmd
+                                        staged_fix
                                     );
                                     let _ = stdout_lock.write_all(exec_msg.as_bytes());
                                     let _ = stdout_lock.flush();
 
-                                    // Inject suggested fix command into PTY stdin
                                     if let Ok(mut writer_guard) = writer_for_reader.lock() {
                                         if let Some(ref mut writer) = *writer_guard {
-                                            let _ = writer.write_all(fix_cmd.as_bytes());
+                                            let _ = writer.write_all(staged_fix.as_bytes());
                                             let _ = writer.write_all(b"\r");
                                             let _ = writer.flush();
                                         }
                                     }
+                                } else {
+                                    let cancel_msg = "\r\n\x1b[31m[Ghost]: Fix execution canceled.\x1b[0m\r\n";
+                                    let _ = stdout_lock.write_all(cancel_msg.as_bytes());
+                                    let _ = stdout_lock.flush();
+                                }
+                            }
+                        }
+
+                        if was_pending {
+                            continue;
+                        }
+
+                        // 2. Handle 'f' or 'fix' trigger keyword
+                        let clean_cmd = trimmed_cmd
+                            .chars()
+                            .filter(|c| c.is_alphanumeric())
+                            .collect::<String>();
+
+                        if clean_cmd == "fix" || clean_cmd == "f" {
+                            if let Ok(mut fix_guard) = last_fix_reader.lock() {
+                                if let Some(fix_cmd) = fix_guard.take() {
+                                    if let Ok(mut pending_guard) = pending_conf_reader.lock() {
+                                        *pending_guard = Some(fix_cmd.clone());
+                                    }
+
+                                    let prompt_msg = format!(
+                                        "\r\n\x1b[33m[Ghost]: Execute fix '{}'? [y/N]: \x1b[0m",
+                                        fix_cmd
+                                    );
+                                    let _ = stdout_lock.write_all(prompt_msg.as_bytes());
+                                    let _ = stdout_lock.flush();
                                 } else {
                                     let _ = stdout_lock.write_all(
                                         b"\r\n\x1b[33m[Ghost]: No pending fix available.\x1b[0m\r\n",
@@ -98,7 +142,7 @@ fn main() -> anyhow::Result<()> {
                                     let _ = stdout_lock.flush();
                                 }
                             }
-                        // B. Check if user ran 'ghost doctor'
+                        // 3. Handle 'ghost doctor' audit command
                         } else if trimmed_cmd.contains("ghost doctor") {
                             let doctor_header = "\r\n\x1b[35m=== Ghost Doctor: Recent CLI Interception History ===\x1b[0m\r\n";
                             let _ = stdout_lock.write_all(doctor_header.as_bytes());
@@ -126,7 +170,7 @@ fn main() -> anyhow::Result<()> {
                                 );
                             }
                             let _ = stdout_lock.flush();
-                        // C. Standard non-zero exit code interception
+                        // 4. Handle failed command (exit code != 0)
                         } else if exit_code != 0 {
                             let context = ring_buffer.get_context();
 
@@ -142,7 +186,6 @@ fn main() -> anyhow::Result<()> {
                                 &context,
                             )) {
                                 Ok(resp) => {
-                                    // Store suggested fix in shared memory
                                     if let Ok(mut fix_guard) = last_fix_reader.lock() {
                                         *fix_guard = Some(resp.suggested_fix.clone());
                                     }
@@ -171,14 +214,12 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Main Loop: Non-blocking stdin polling + Child Exit Monitoring
+    // Main loop: Listen for host keypresses and forward to PTY stdin
     loop {
-        // 1. Check if child process (bash/cmd) has exited
         if let Ok(Some(_)) = shell_pty.child.try_wait() {
             break;
         }
 
-        // 2. Non-blocking input polling (10ms tick rate)
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
@@ -200,30 +241,14 @@ fn main() -> anyhow::Result<()> {
                                         let _ = writer.write_all(s.as_bytes());
                                     }
                                 }
-                                KeyCode::Enter => {
-                                    let _ = writer.write_all(b"\r");
-                                }
-                                KeyCode::Backspace => {
-                                    let _ = writer.write_all(&[8]);
-                                }
-                                KeyCode::Tab => {
-                                    let _ = writer.write_all(b"\t");
-                                }
-                                KeyCode::Esc => {
-                                    let _ = writer.write_all(&[27]);
-                                }
-                                KeyCode::Up => {
-                                    let _ = writer.write_all(b"\x1b[A");
-                                }
-                                KeyCode::Down => {
-                                    let _ = writer.write_all(b"\x1b[B");
-                                }
-                                KeyCode::Right => {
-                                    let _ = writer.write_all(b"\x1b[C");
-                                }
-                                KeyCode::Left => {
-                                    let _ = writer.write_all(b"\x1b[D");
-                                }
+                                KeyCode::Enter => { let _ = writer.write_all(b"\r"); }
+                                KeyCode::Backspace => { let _ = writer.write_all(&[8]); }
+                                KeyCode::Tab => { let _ = writer.write_all(b"\t"); }
+                                KeyCode::Esc => { let _ = writer.write_all(&[27]); }
+                                KeyCode::Up => { let _ = writer.write_all(b"\x1b[A"); }
+                                KeyCode::Down => { let _ = writer.write_all(b"\x1b[B"); }
+                                KeyCode::Right => { let _ = writer.write_all(b"\x1b[C"); }
+                                KeyCode::Left => { let _ = writer.write_all(b"\x1b[D"); }
                                 _ => {}
                             }
                             let _ = writer.flush();
@@ -234,13 +259,13 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Clean teardown sequence: Explicitly close PTY stdin so reader loop sees EOF
+    // Teardown: Close PTY stdin so reader thread receives EOF and exits cleanly
     if let Ok(mut guard) = shared_writer.lock() {
-        *guard = None; // Drops the underlying PTY writer
+        *guard = None;
     }
 
-    let _ = reader_handle.join(); // Reader thread receives EOF and joins cleanly
-    drop(raw_guard);              // Restore normal terminal modes
+    let _ = reader_handle.join();
+    drop(raw_guard);
     let _ = io::stdout().flush();
 
     Ok(())
