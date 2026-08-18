@@ -1,5 +1,6 @@
 {
   "python.analysis.extraPaths": [
     "./ghost-daemon/src"
-  ]
+  ],
+  "postman.settings.dotenv-detection-notification-visibility": false
 }

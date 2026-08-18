@@ -1,13 +1,17 @@
 mod boundary;
 mod buffer;
+mod doctor;
 mod ipc_client;
 mod pty;
+mod safety;
 mod terminal;
 
 use boundary::{BoundaryParser, CommandStatus};
 use buffer::RollingBuffer;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use doctor::handle_doctor_cli;
 use pty::ShellPty;
+use safety::{evaluate_risk, RiskLevel};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,8 +23,8 @@ fn main() -> anyhow::Result<()> {
     let mut shell_pty = ShellPty::spawn()?;
     let raw_guard = RawModeGuard::new()?;
 
-    let pty_reader = shell_pty.master.try_clone_reader()?;
-    let raw_writer = shell_pty.master.take_writer()?;
+    let pty_reader = shell_pty.pair.master.try_clone_reader()?;
+    let raw_writer = shell_pty.pair.master.take_writer()?;
 
     // Thread-safe shared PTY writer wrapped in Option for clean teardown
     type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
@@ -28,17 +32,17 @@ fn main() -> anyhow::Result<()> {
     let writer_for_reader = Arc::clone(&shared_writer);
     let writer_for_main = Arc::clone(&shared_writer);
 
-    // Register no-op aliases in bash so trigger keywords don't trigger 'command not found'
-    if let Ok(mut guard) = shared_writer.lock() {
-        if let Some(ref mut writer) = *guard {
-            let _ = writer.write_all(
-                b"alias f=':' fix=':' y=':' yes=':' Y=':' YES=':' n=':' no=':' N=':' NO=':' 2>/dev/null; clear\r",
-            );
-            let _ = writer.flush();
+    // Register shell-native no-op aliases & boundary hooks dynamically
+    if let Some(payload) = shell_pty.get_alias_init_payload() {
+        if let Ok(mut guard) = shared_writer.lock() {
+            if let Some(ref mut writer) = *guard {
+                let _ = writer.write_all(payload);
+                let _ = writer.flush();
+            }
         }
     }
 
-    // Shared storage for cached AI fixes and pending [y/N] prompts
+    // Shared storage for cached AI fixes and pending confirmation prompts
     let last_suggested_fix: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let last_fix_reader = Arc::clone(&last_suggested_fix);
 
@@ -78,18 +82,27 @@ fn main() -> anyhow::Result<()> {
                         let last_cmd = ring_buffer.extract_last_command();
                         let trimmed_cmd = last_cmd.trim().to_lowercase();
 
-                        // 1. Handle user answer to [y/N] prompt
+                        // 1. Handle user answer to confirmation prompt
                         let mut was_pending = false;
                         if let Ok(mut pending_guard) = pending_conf_reader.lock() {
                             if let Some(staged_fix) = pending_guard.take() {
                                 was_pending = true;
 
+                                let risk = evaluate_risk(&staged_fix);
                                 let clean_ans = trimmed_cmd
                                     .chars()
                                     .filter(|c| c.is_alphanumeric())
                                     .collect::<String>();
 
-                                if clean_ans == "y" || clean_ans == "yes" || clean_ans.starts_with('y') {
+                                let is_confirmed = match risk {
+                                    RiskLevel::Critical => false,
+                                    RiskLevel::HighRisk => clean_ans == "confirm",
+                                    RiskLevel::Safe => {
+                                        clean_ans == "y" || clean_ans == "yes" || clean_ans.starts_with('y')
+                                    }
+                                };
+
+                                if is_confirmed {
                                     let exec_msg = format!(
                                         "\r\n\x1b[32m[Ghost Executing Fix]: {}\x1b[0m\r\n",
                                         staged_fix
@@ -125,16 +138,40 @@ fn main() -> anyhow::Result<()> {
                         if clean_cmd == "fix" || clean_cmd == "f" {
                             if let Ok(mut fix_guard) = last_fix_reader.lock() {
                                 if let Some(fix_cmd) = fix_guard.take() {
-                                    if let Ok(mut pending_guard) = pending_conf_reader.lock() {
-                                        *pending_guard = Some(fix_cmd.clone());
-                                    }
+                                    let risk = evaluate_risk(&fix_cmd);
 
-                                    let prompt_msg = format!(
-                                        "\r\n\x1b[33m[Ghost]: Execute fix '{}'? [y/N]: \x1b[0m",
-                                        fix_cmd
-                                    );
-                                    let _ = stdout_lock.write_all(prompt_msg.as_bytes());
-                                    let _ = stdout_lock.flush();
+                                    match risk {
+                                        RiskLevel::Critical => {
+                                            let blocked_msg = format!(
+                                                "\r\n\x1b[31;1m[Ghost Critical Safety Block]: Fix contains catastrophic destruction ('{}')\x1b[0m\r\n\x1b[31m[Ghost]: Execution refused for system safety.\x1b[0m\r\n",
+                                                fix_cmd
+                                            );
+                                            let _ = stdout_lock.write_all(blocked_msg.as_bytes());
+                                            let _ = stdout_lock.flush();
+                                        }
+                                        RiskLevel::HighRisk => {
+                                            if let Ok(mut pending_guard) = pending_conf_reader.lock() {
+                                                *pending_guard = Some(fix_cmd.clone());
+                                            }
+                                            let prompt_msg = format!(
+                                                "\r\n\x1b[31;1m[Ghost Safety Warning]: Command contains destructive/state-altering flags!\x1b[0m\r\n\x1b[33m[Ghost]: Execute fix '{}'? Type 'CONFIRM' to run: \x1b[0m",
+                                                fix_cmd
+                                            );
+                                            let _ = stdout_lock.write_all(prompt_msg.as_bytes());
+                                            let _ = stdout_lock.flush();
+                                        }
+                                        RiskLevel::Safe => {
+                                            if let Ok(mut pending_guard) = pending_conf_reader.lock() {
+                                                *pending_guard = Some(fix_cmd.clone());
+                                            }
+                                            let prompt_msg = format!(
+                                                "\r\n\x1b[33m[Ghost]: Execute fix '{}'? [y/N]: \x1b[0m",
+                                                fix_cmd
+                                            );
+                                            let _ = stdout_lock.write_all(prompt_msg.as_bytes());
+                                            let _ = stdout_lock.flush();
+                                        }
+                                    }
                                 } else {
                                     let _ = stdout_lock.write_all(
                                         b"\r\n\x1b[33m[Ghost]: No pending fix available.\x1b[0m\r\n",
@@ -142,35 +179,12 @@ fn main() -> anyhow::Result<()> {
                                     let _ = stdout_lock.flush();
                                 }
                             }
-                        // 3. Handle 'ghost doctor' audit command
+                        // 3. Handle 'ghost doctor' CLI sub-commands (--search, --stats, --export)
                         } else if trimmed_cmd.contains("ghost doctor") {
-                            let doctor_header = "\r\n\x1b[35m=== Ghost Doctor: Recent CLI Interception History ===\x1b[0m\r\n";
-                            let _ = stdout_lock.write_all(doctor_header.as_bytes());
-
-                            if let Ok(hist) = handle.block_on(ipc_client::fetch_history(5)) {
-                                if hist.history.is_empty() {
-                                    let _ = stdout_lock.write_all(
-                                        b"No intercepted failures found in ghost_session.db.\r\n",
-                                    );
-                                } else {
-                                    for record in hist.history {
-                                        let entry = format!(
-                                            "\x1b[33m[{}]\x1b[0m \x1b[1mCommand:\x1b[0m {}\r\n  \x1b[36mDiagnosis:\x1b[0m {}\r\n  \x1b[32mSuggested Fix:\x1b[0m {}\r\n\r\n",
-                                            record.timestamp,
-                                            record.command,
-                                            record.diagnosis,
-                                            record.suggested_fix
-                                        );
-                                        let _ = stdout_lock.write_all(entry.as_bytes());
-                                    }
-                                }
-                            } else {
-                                let _ = stdout_lock.write_all(
-                                    b"\x1b[31mFailed to connect to ghost_daemon at http://127.0.0.1:8000\x1b[0m\r\n",
-                                );
-                            }
+                            let doctor_output = handle_doctor_cli(&last_cmd, &handle);
+                            let _ = stdout_lock.write_all(doctor_output.as_bytes());
                             let _ = stdout_lock.flush();
-                        // 4. Handle failed command (exit code != 0)
+                        // 4. Handle command failure (exit code != 0)
                         } else if exit_code != 0 {
                             let context = ring_buffer.get_context();
 
@@ -214,7 +228,7 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Main loop: Listen for host keypresses and forward to PTY stdin
+    // Main loop: Listen for host keypresses and forward transparently to PTY stdin
     loop {
         if let Ok(Some(_)) = shell_pty.child.try_wait() {
             break;
@@ -229,10 +243,10 @@ fn main() -> anyhow::Result<()> {
                                 KeyCode::Char(c) => {
                                     if key.modifiers.contains(KeyModifiers::CONTROL) {
                                         match c {
-                                            'c' | 'C' => { let _ = writer.write_all(&[3]); }  // Ctrl+C
-                                            'd' | 'D' => { let _ = writer.write_all(&[4]); }  // Ctrl+D
-                                            'z' | 'Z' => { let _ = writer.write_all(&[26]); } // Ctrl+Z
-                                            'l' | 'L' => { let _ = writer.write_all(&[12]); } // Ctrl+L
+                                            'c' | 'C' => { let _ = writer.write_all(&[3]); }
+                                            'd' | 'D' => { let _ = writer.write_all(&[4]); }
+                                            'z' | 'Z' => { let _ = writer.write_all(&[26]); }
+                                            'l' | 'L' => { let _ = writer.write_all(&[12]); }
                                             _ => {}
                                         }
                                     } else {
