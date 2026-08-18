@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
+
 load_dotenv()
 
 from db import (
@@ -40,32 +41,33 @@ async def diagnose(req: DiagnoseRequest):
     workspace = req.workspace_root or resolve_workspace(req.cwd)
     historical_notes = get_historical_context(req.command, workspace)
 
-    ai_result, source = await get_hybrid_diagnosis(
-        command=req.command,
-        exit_code=req.exit_code,
-        context=req.output_context,
-        workspace=workspace,
-        historical_notes=historical_notes,
-    )
-
-    if ai_result:
-        diagnosis = ai_result.diagnosis
-        suggested_fix = ai_result.suggested_fix
-        explanation = ai_result.explanation
-        confidence = 0.95 if source != "ollama" else 0.88
+    # 1. Fast-Path Rules
+    if "cat" in req.command and "No such file or directory" in req.output_context:
+        missing_file = req.command.split()[-1] if len(req.command.split()) > 1 else "file"
+        diagnosis = f"Target file '{missing_file}' does not exist in the current directory."
+        suggested_fix = f"touch {missing_file}"
+        explanation = "The cat command requires an existing file path to read."
+        source = "fast_path"
+        confidence = 0.85
     else:
-        # Regex / Fast-Path Fallback
-        if "cat" in req.command and "No such file or directory" in req.output_context:
-            missing_file = req.command.split()[-1] if len(req.command.split()) > 1 else "file"
-            diagnosis = f"Target file '{missing_file}' does not exist in the current directory."
-            suggested_fix = f"touch {missing_file}"
-            explanation = "The cat command requires an existing file path to read."
-            source = "fast_path"
-            confidence = 0.85
+        # 2. Hybrid AI Engine Query (Groq -> Ollama)
+        ai_result, source = await get_hybrid_diagnosis(
+            command=req.command,
+            exit_code=req.exit_code,
+            context=req.output_context,
+            workspace=workspace,
+            historical_notes=historical_notes,
+        )
+
+        if ai_result:
+            diagnosis = ai_result.diagnosis
+            suggested_fix = ai_result.suggested_fix
+            explanation = ai_result.explanation
+            confidence = 0.95 if source != "ollama" else 0.88
         else:
             diagnosis = f"Command '{req.command}' failed with exit code {req.exit_code}."
             suggested_fix = "ghost doctor"
-            explanation = "No cloud or local inference engine available. Check connectivity or Ollama."
+            explanation = "No inference engine available."
             source = "stub"
             confidence = 0.50
 
@@ -111,4 +113,5 @@ async def get_stats():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
