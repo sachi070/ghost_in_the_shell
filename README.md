@@ -45,43 +45,37 @@ When a command, compiler, or deployment script exits with a non-zero status code
 ## System Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│                     User's Terminal                     │
-└───────────────────────────┬─────────────────────────────┘
-                             │ Raw keystrokes / ANSI streams
-                             ▼
-┌─────────────────────────────────────────────────────────┐
-│              Ghost Binary (ghost-core, Rust)             │
+┌──────────────────────────────────────────────────────────┐
+│                     User's Terminal                      │
+└──────────────────────────────────────────────────────────┘
+                         │ Raw keystrokes / ANSI streams
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│             Ghost Binary (ghost-core, Rust)              │
+│                                                          │
 │  - Allocates system PTY (portable-pty)                   │
-│  - Spawns target shell (Bash / Zsh / PowerShell)          │
-│  - BoundaryParser: listens for OSC 1337 exit markers       │
-│  - RollingBuffer: ring buffer of last 50 console lines      │
-│  - Safety Engine: evaluates RiskLevel (Safe/Warn/Block)      │
-│  - IPC Client: JSON payload dispatch over HTTP                │
-└───────────────────────────┬───────────────────────────────────┘
-                             │ Local IPC (HTTP / Port 8000)
-                             ▼
-┌─────────────────────────────────────────────────────────┐
-│            Ghost Daemon (ghost_daemon, Python)            │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │ Fast-Path Regex Matcher (instant common fixes)     │   │
-│  └────────────────────────┬──────────────────────────┘   │
-│                            │ Miss → escalate               │
-│  ┌────────────────────────▼──────────────────────────┐   │
-│  │ Workspace Resolver (Git root detection & context)  │   │
-│  └────────────────────────┬──────────────────────────┘   │
-│                            ▼                                │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │ Hybrid AI Inference Engine                          │   │
-│  │ ├─ Primary: Groq / OpenRouter                       │   │
-│  │ └─ Fallback: Local Ollama (qwen2.5-coder)            │   │
-│  └────────────────────────┬──────────────────────────┘   │
-│                            ▼                                │
-│  ┌───────────────────────────────────────────────────┐   │
-│  │ SQLite Session Storage (ghost_session.db)           │   │
-│  │ - Interception log, recurring counts, analytics     │   │
-│  └───────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+│  - Spawns target shell (Bash / Zsh / PowerShell)         │
+│  - BoundaryParser: listens for OSC 1337 exit markers     │
+│  - RollingBuffer: ring buffer of last 50 console lines   │
+│  - Safety Engine: evaluates RiskLevel (Safe/Warn/Block)  │
+│  - IPC Client: JSON payload dispatch over HTTP           │
+└──────────────────────────────────────────────────────────┘
+                         │ Local IPC (HTTP / Port 8000)
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│           Ghost Daemon (ghost_daemon, Python)            │
+│                                                          │
+│  Fast-Path Regex Matcher (instant common fixes)          │
+│    -> miss escalates to:                                 │
+│  Workspace Resolver (Git root detection & context)       │
+│    -> then:                                              │
+│  Hybrid AI Inference Engine                              │
+│    - Primary: Groq / OpenRouter                          │
+│    - Fallback: Local Ollama (qwen2.5-coder)              │
+│    -> then:                                              │
+│  SQLite Session Storage (ghost_session.db)               │
+│    - Interception log, recurring counts, analytics       │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
