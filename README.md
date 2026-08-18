@@ -1,159 +1,234 @@
-#  Ghost in the Shell
+# Ghost in the Shell
 
-**Ghost in the Shell** is a dual-tier, AI-augmented terminal environment that transparently wraps shell sessions (Bash, CMD, Git Bash), intercepts non-zero exit codes, diagnoses root causes via Groq AI, logs CLI failure history in SQLite, and enables one-character auto-execution of AI fixes.
+> **An AI-powered, self-healing terminal wrapper built in Rust and Python that intercepts failed shell commands at the PTY level, diagnoses root causes with low-latency LLMs, and stages safe, human-in-the-loop fixes with near-zero execution overhead.**
 
-##  Key Features
+---
 
-* **Transparent PTY Wrapping**: Spawns sub-shells inside a native Pseudo-Terminal (PTY) with non-blocking keypress forwarding (`Ctrl+C`, `Ctrl+D`, arrow keys, UTF-8).
-* **Automatic Error Interception**: Detects command completion boundaries and exit codes (`!= 0`) without disturbing normal stdout/stderr rendering.
-* **Groq LLM Diagnostics**: Streams surrounding terminal context (last 50 lines) to a local daemon powered by Groq LLaMA models for instant root-cause analysis.
-* **Interactive Auto-Fix (`f` / `fix`)**: Stage AI-suggested fixes with a single letter (`f` or `fix`) and execute them safely with `[y/N]` interactive confirmation.
-* **Silent Shell Alias Layer**: Registers startup no-op aliases (`f=':'`, `y=':'`) to prevent `bash: command not found` errors during fix injection.
-* **`ghost doctor` Audit Command**: Built-in CLI history browser that displays past failures, diagnoses, and fixes stored in a persistent SQLite database (`ghost_session.db`).
+## Overview
 
-## 🏗️ System Architecture
+Most developer AI tools live in a separate chat window, disconnected from where errors actually happen. **Ghost in the Shell** is invisible developer infrastructure — it sits directly on the terminal's keystroke path using native pseudoterminals (PTY).
+
+When a command, compiler, or deployment script exits with a non-zero status code:
+
+1. **Ghost intercepts stdout/stderr** and process boundaries using injected `OSC 1337` escape markers.
+2. **Streams the terminal context** to a local Python daemon over IPC.
+3. **Diagnoses the root cause** using low-latency inference (Groq / OpenRouter), with automatic offline fallback to a local **Ollama** model.
+4. **Evaluates command execution safety** across a 3-tier risk matrix.
+5. **Stages the fix inline**, letting you run it instantly by typing `f` or `fix`.
+
+---
+
+## Features
+
+- **Multi-Shell Auto-Detection** — Native support for **Bash**, **Zsh**, and **PowerShell** (`pwsh.exe` / `powershell.exe`), with platform-specific boundary markers and silent alias injection.
+- **Zero Hot-Path Overhead** — Written in **Rust** using `portable-pty` for async byte forwarding and transparent raw-mode terminal handling.
+- **Hybrid Cloud + Offline AI Engine**
+  - **Primary:** Groq (`llama-3.3-70b-versatile`) or OpenRouter.
+  - **Fallback:** Local inference via Ollama (`qwen2.5-coder` / `llama3.2`) with automatic failover when disconnected.
+- **3-Tier Execution Safety Engine**
+  - **Safe** (`touch`, `mkdir`, `npm install`) — standard `[y/N]` confirmation.
+  - **High-Risk / Destructive** (`rm -rf`, `git reset --hard`, `DROP TABLE`) — warning banner, requires typing `CONFIRM`.
+  - **Critical Block** (`rm -rf /`, `mkfs`, `dd if=/dev/zero of=/dev/sda`) — hard execution block with explanation.
+- **Workspace-Aware SQLite Memory** — Detects Git roots (`git rev-parse --show-toplevel`) to isolate diagnostic history per repository and surface recurring-error counts.
+- **`ghost doctor` Diagnostic Suite**
+  - `ghost doctor` — inspect recent command failures and their fixes.
+  - `ghost doctor --search "<query>"` — full-text search across past terminal errors.
+  - `ghost doctor --stats` — breakdown of top failing commands, workspace error distribution, and AI-engine invocation counts.
+  - `ghost doctor --export markdown --out report.md` — generate diagnostic audit reports in Markdown or JSON.
+
+### Roadmap
+- **"Explain this error" mode** — an on-demand explanation of the failure printed straight to the terminal, kept separate from the auto-fix flow.
+- Optional pairing with a companion CLI scaffolding tool for generating pre-documented project folder structures (e.g. FastAPI `src/app` layouts).
+
+---
+
+## System Architecture
 
 ```text
-+-----------------------------------------------------------------------------------+
-|                                  GHOST ARCHITECTURE                               |
-+-----------------------------------------------------------------------------------+
-|                                                                                   |
-|  [ User Input ]  --->  [ ghost-core (Rust PTY Runner) ]                           |
-|                             |                                                     |
-|                             +---> Raw Mode Terminal Loop (crossterm)              |
-|                             +---> Boundary Parser & ANSI State Machine            |
-|                             +---> Shared Thread-Safe PTY Writer                   |
-|                             |                                                     |
-|                             v (HTTP IPC / JSON)                                   |
-|                        [ ghost_daemon (Python FastAPI) ]                          |
-|                             |                                                     |
-|                             +---> Groq LLaMA Diagnostic Engine                    |
-|                             +---> SQLite Storage (ghost_session.db)               |
-|                                                                                   |
-+-----------------------------------------------------------------------------------+
+┌─────────────────────────────────────────────────────────┐
+│                     User's Terminal                     │
+└───────────────────────────┬─────────────────────────────┘
+                             │ Raw keystrokes / ANSI streams
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│              Ghost Binary (ghost-core, Rust)             │
+│  - Allocates system PTY (portable-pty)                   │
+│  - Spawns target shell (Bash / Zsh / PowerShell)          │
+│  - BoundaryParser: listens for OSC 1337 exit markers       │
+│  - RollingBuffer: ring buffer of last 50 console lines      │
+│  - Safety Engine: evaluates RiskLevel (Safe/Warn/Block)      │
+│  - IPC Client: JSON payload dispatch over HTTP                │
+└───────────────────────────┬───────────────────────────────────┘
+                             │ Local IPC (HTTP / Port 8000)
+                             ▼
+┌─────────────────────────────────────────────────────────┐
+│            Ghost Daemon (ghost_daemon, Python)            │
+│  ┌───────────────────────────────────────────────────┐   │
+│  │ Fast-Path Regex Matcher (instant common fixes)     │   │
+│  └────────────────────────┬──────────────────────────┘   │
+│                            │ Miss → escalate               │
+│  ┌────────────────────────▼──────────────────────────┐   │
+│  │ Workspace Resolver (Git root detection & context)  │   │
+│  └────────────────────────┬──────────────────────────┘   │
+│                            ▼                                │
+│  ┌───────────────────────────────────────────────────┐   │
+│  │ Hybrid AI Inference Engine                          │   │
+│  │ ├─ Primary: Groq / OpenRouter                       │   │
+│  │ └─ Fallback: Local Ollama (qwen2.5-coder)            │   │
+│  └────────────────────────┬──────────────────────────┘   │
+│                            ▼                                │
+│  ┌───────────────────────────────────────────────────┐   │
+│  │ SQLite Session Storage (ghost_session.db)           │   │
+│  │ - Interception log, recurring counts, analytics     │   │
+│  └───────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## 🛠️ Technical Stack
+---
 
-| Layer               | Component       | Technologies                                          |
-| ------------------- | --------------- | ----------------------------------------------------- |
-| **Terminal Runner** | `ghost-core`    | Rust, `portable-pty`, `crossterm`, `tokio`, `reqwest` |
-| **Backend Daemon**  | `ghost_daemon`  | Python 3.12, FastAPI, Uvicorn, Groq API, SQLite       |
-| **IPC Pipeline**    | Local REST/JSON | Async HTTP over `http://127.0.0.1:8000`               |
-| **Stream Parser**   | Boundary Engine | Custom ANSI/OSC State Machine & FIFO Rolling Buffer   |
+## Getting Started
 
-## 🛠️ Installation & Prerequisites
+### Prerequisites
 
-### Requirements
+- **Rust toolchain** (Cargo 1.80+)
+- **Python 3.10+** (managed via `uv` or `venv`)
+- *(Optional)* **Ollama**, installed locally for air-gapped / offline fallback:
+  ```bash
+  ollama pull qwen2.5-coder:latest
+  ```
 
-* **Rust** (1.75+ toolchain with `cargo`)
-* **Python** (3.12+ with `uv` package manager)
-* **Groq API Key**
-
-## 🚀 Getting Started
-
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/sachi070/ghost-in-the-shell.git
-cd ghost-in-the-shell
-```
-
-### 2. Set Up Environment Variables
-
-Create a `.env` file inside `ghost_daemon/`:
-
-```env
-GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
-```
-
-### 3. Launch the Backend Daemon (`ghost_daemon`)
-
-In your first terminal window:
+### 1. Start the background daemon (`ghost_daemon`)
 
 ```bash
 cd ghost_daemon
+
+# Install dependencies using uv (or pip)
+uv sync
+
+# Configure environment keys
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```ini
+GROQ_API_KEY="gsk_your_groq_api_key_here"
+
+# Optional fallback configuration:
+# OPENROUTER_API_KEY="sk-or-..."
+# GHOST_LLM_MODEL="llama-3.3-70b-versatile"
+# OLLAMA_HOST="http://127.0.0.1:11434"
+# GHOST_LOCAL_MODEL="qwen2.5-coder:latest"
+```
+
+Start the daemon:
+
+```bash
 uv run python main.py
 ```
 
-*Daemon starts listening on `http://127.0.0.1:8000`.*
+### 2. Launch the transparent PTY shell (`ghost-core`)
 
-### 4. Run the Terminal Runner (`ghost-core`)
-
-In your second terminal window:
+In a new terminal window:
 
 ```bash
 cd ghost-core
-cargo run
+cargo run --release
 ```
 
-##  Usage Example
+Ghost spawns your default active shell wrapped inside the PTY layer.
 
-### 1. Trigger an Error
+---
 
-Run a command that fails (returns exit code `!= 0`):
+## Usage & Examples
+
+### 1. Intercepting a failure and auto-fixing
 
 ```bash
-$ cat missing_config.json
-cat: missing_config.json: No such file or directory
+$ cat non_existent_file.txt
+cat: non_existent_file.txt: No such file or directory
 
 [Ghost Intercepted Failure: Exit Code 1]
-[Ghost Diagnosis]: The file 'missing_config.json' does not exist in the current directory.
-[Suggested Fix]: touch missing_config.json
+[Ghost Diagnosis]: Target file 'non_existent_file.txt' does not exist in the current directory.
+[Suggested Fix]: touch non_existent_file.txt
 [Type 'fix' or 'f' to auto-execute this fix]
+
+$ f
+[Ghost]: Execute fix 'touch non_existent_file.txt'? [y/N]: y
+[Ghost Executing Fix]: touch non_existent_file.txt
 ```
 
-### 2. Request Fix Execution
+### 2. High-risk safety confirmation
 
-Type `f` or `fix` and press **Enter**:
+When a proposed fix contains state-altering flags (`rm -rf`, `git reset --hard`, `DROP TABLE`), Ghost requires explicit confirmation:
 
 ```bash
 $ f
-
-[Ghost]: Execute fix 'touch missing_config.json'? [y/N]:
+[Ghost Safety Warning]: Command contains destructive/state-altering flags!
+[Ghost]: Execute fix 'git reset --hard HEAD~1'? Type 'CONFIRM' to run: CONFIRM
+[Ghost Executing Fix]: git reset --hard HEAD~1
 ```
 
-### 3. Confirm Execution
-
-Type `y` and press **Enter**:
+### 3. Querying `ghost doctor`
 
 ```bash
-$ y
-
-[Ghost Executing Fix]: touch missing_config.json
-```
-
-### 4. View Audit History
-
-To review recent CLI interceptions and fixes stored in SQLite:
-
-```bash
+# View recent intercepted failures
 $ ghost doctor
 
-=== Ghost Doctor: Recent CLI Interception History ===
-[2026-08-12 09:30:15] Command: cat missing_config.json
-  Diagnosis: The file 'missing_config.json' does not exist in the current directory.
-  Suggested Fix: touch missing_config.json
+# Full-text search across past error diagnoses
+$ ghost doctor --search "npm"
+
+# View recurring error analytics and engine breakdowns
+$ ghost doctor --stats
+
+# Export audit logs to Markdown
+$ ghost doctor --export markdown --out debug_report.md
 ```
 
-## 📁 Repository Structure
+---
+
+## Repository Structure
 
 ```text
 ghost-in-the-shell/
-├── ghost-core/               # Rust Terminal Runner (PTY, Parser, IPC Client)
-│   ├── src/
-│   │   ├── boundary.rs       # Stream parsing & command boundary detector
-│   │   ├── buffer.rs         # Rolling 50-line context buffer & ANSI filter
-│   │   ├── ipc_client.rs     # Async HTTP client for ghost_daemon
-│   │   ├── main.rs           # Multi-threaded PTY reader/writer & input loop
-│   │   ├── pty.rs            # portable-pty sub-shell spawner
-│   │   └── terminal.rs       # Raw mode terminal guard (RAII)
-│   └── Cargo.toml
+├── ghost-core/                     # Rust systems / PTY layer
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs                 # Raw mode loop, key handling, and IPC dispatch
+│       ├── pty.rs                  # Cross-platform shell spawn & boundary hook injection
+│       ├── boundary.rs             # OSC 1337 escape token parser & exit code detection
+│       ├── safety.rs               # 3-tier risk engine (Safe, HighRisk, Critical)
+│       ├── buffer.rs               # Circular ring buffer for terminal stdout context
+│       ├── doctor.rs               # ghost doctor CLI formatter, stats & export engine
+│       ├── ipc_client.rs           # Client bindings to Python daemon (reqwest)
+│       └── terminal.rs             # Raw terminal guard & ANSI reset routines
 │
-└── ghost_daemon/             # Python FastAPI Backend & AI Engine
-    ├── main.py               # FastAPI server endpoints (/diagnose, /history)
-    ├── database.py           # SQLite persistence layer (ghost_session.db)
-    ├── groq_service.py       # Groq LLM prompt builder & diagnostic engine
-    └── pyproject.toml
+├── ghost_daemon/                   # Python / FastAPI AI backend
+│   ├── pyproject.toml              # Dependency manifest (uv)
+│   ├── main.py                     # FastAPI server routes & lifespan management
+│   ├── llm_client.py               # Hybrid LLM engine (Groq -> OpenRouter -> Ollama)
+│   ├── db.py                       # SQLite schema, migrations, and workspace analytics
+│   ├── models.py                   # Pydantic schemas for request/response validation
+│   └── ipc_server.py               # Auxiliary IPC socket listener
+│
+├── shell-hooks/                    # Injected boundary scripts
+│   ├── ghost.bash                  # Bash PROMPT_COMMAND hook
+│   ├── ghost.zsh                   # Zsh precmd hook
+│   └── ghost.ps1                   # PowerShell $Function:prompt hook
+│
+└── README.md
 ```
+
+---
+
+## Security & Design Philosophy
+
+- **Non-destructive by default** — Ghost never executes commands autonomously; every suggestion requires explicit user confirmation.
+- **Prompt-injection defense** — raw error streams are sanitized and passed through structured JSON schemas (`response_format={"type": "json_object"}`) before parsing, so malicious shell output can't escape its boundaries.
+- **Air-gapped operation** — sensitive or disconnected environments can run Ghost entirely on local hardware via Ollama, with no terminal context ever sent over the network.
+
+---
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for details.
